@@ -338,6 +338,31 @@ The executable example below still imports the compatibility name
     :start-after: [START how_to_cloud_dataproc_submit_job_to_cluster_operator]
     :end-before: [END how_to_cloud_dataproc_submit_job_to_cluster_operator]
 
+Durable execution
+^^^^^^^^^^^^^^^^^
+
+``DataprocSubmitJobOperator`` submits a job and then waits on the worker for it to finish. By
+default the operator runs in a *durable* mode that makes this crash-safe: the submitted job id is
+persisted to :doc:`task state store <apache-airflow:core-concepts/task-state-store>` before
+waiting begins, so if the worker crashes or is preempted and the task is retried, the operator
+reconnects to the job that is already running on the cluster instead of submitting a duplicate.
+
+On retry the operator checks the prior job's state:
+
+* if it is ``PENDING``, ``SETUP_DONE``, ``RUNNING`` or ``ATTEMPT_FAILURE``, the operator reconnects
+  and continues waiting
+* if it is ``DONE``, the operator returns immediately without resubmitting
+* if it is ``ERROR`` or ``CANCELLED``, is being cancelled, or its id is no longer found, the
+  operator submits the job fresh
+
+Durable execution only applies when ``deferrable`` and ``asynchronous`` are both ``False``. Set
+``durable=False`` to always submit a fresh job on retry.
+
+Durable execution requires Airflow 3.3 or newer, since it relies on the task state store. On
+earlier Airflow versions the flag is a no-op (setting it explicitly only emits a warning) and the
+operator always submits a fresh job on retry, exactly as before. If the task state store is
+unavailable at runtime, the operator logs that crash recovery is disabled and behaves the same way.
+
 Examples of job configurations to submit
 ----------------------------------------
 

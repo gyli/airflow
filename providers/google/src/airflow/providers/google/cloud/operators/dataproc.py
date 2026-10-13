@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
+import warnings
 from collections.abc import MutableSequence, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -65,12 +66,46 @@ from airflow.providers.google.common.deprecated import deprecated
 from airflow.providers.google.common.hooks.base_google import PROVIDE_PROJECT_ID
 from airflow.triggers.base import StartTriggerArgs
 
+_DURABLE_UNSET = object()
+
+
+def _warn_and_disable_durable_pre_3_3(durable: Any) -> bool:
+    """Shared by the <3.3 compat stub: durable has no effect below 3.3, warn if it was set."""
+    if durable is not _DURABLE_UNSET:
+        warnings.warn(
+            "`durable` has no effect on Airflow versions below 3.3.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return False
+
+
+try:
+    from airflow.sdk import ResumableJobMixin
+except ImportError:
+
+    class ResumableJobMixin:  # type: ignore[no-redef]
+        """Airflow <3.3 stub, task_state_store unavailable, always submits fresh."""
+
+        external_id_key: str = "dataproc_job_id"
+
+        def __init__(self, *, durable: Any = _DURABLE_UNSET, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.durable = _warn_and_disable_durable_pre_3_3(durable)
+
+        def execute_resumable(self, context):
+            external_id = self.submit_job(context)
+            self.poll_until_complete(external_id, context)
+            return self.get_job_result(external_id, context)
+
+
 if TYPE_CHECKING:
     from google.api_core import operation
     from google.api_core.retry_async import AsyncRetry
     from google.protobuf.duration_pb2 import Duration
     from google.protobuf.field_mask_pb2 import FieldMask
     from google.type.interval_pb2 import Interval
+    from pydantic import JsonValue
 
     from airflow.providers.common.compat.sdk import Context
 
@@ -1892,7 +1927,7 @@ class DataprocInstantiateInlineWorkflowTemplateOperator(GoogleCloudBaseOperator)
             )
 
 
-class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
+class DataprocSubmitJobOperator(ResumableJobMixin, GoogleCloudBaseOperator):
     """
     Submit a job to a cluster.
 
@@ -1931,6 +1966,11 @@ class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
     :param wait_timeout: How many seconds wait for job to be ready. Used only if ``asynchronous`` is False
     :param start_from_trigger: If True and deferrable is True, the operator will start directly
         from the triggerer without occupying a worker slot.
+    :param durable: When ``True`` (the default), the submitted Dataproc job id is persisted to task
+        state before polling begins. On retry after a worker crash, the operator reconnects to the
+        existing job instead of submitting a duplicate. Only applies when ``deferrable`` and
+        ``asynchronous`` are both ``False``. Set to ``False`` to always submit fresh on retry.
+        Requires Airflow 3.3+; no-op on earlier versions.
     """
 
     template_fields: Sequence[str] = (
@@ -1944,6 +1984,7 @@ class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
     template_fields_renderers = {"job": "json"}
 
     operator_extra_links = (DataprocJobLink(),)
+    external_id_key = "dataproc_job_id"
 
     start_trigger_args = StartTriggerArgs(
         trigger_cls="airflow.providers.google.cloud.triggers.dataproc.DataprocSubmitJobDirectTrigger",
@@ -1978,8 +2019,13 @@ class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
         openlineage_inject_transport_info: bool = conf.getboolean(
             "openlineage", "spark_inject_transport_info", fallback=False
         ),
+        durable: bool | None = None,
         **kwargs,
     ) -> None:
+        # Named here (not left to **kwargs) so default_args reaches it on every
+        # supported Airflow version.
+        if durable is not None:
+            kwargs["durable"] = durable
         super().__init__(**kwargs)
         if deferrable and polling_interval_seconds <= 0:
             raise ValueError("Invalid value for polling_interval_seconds. Expected value greater than 0")
@@ -2022,13 +2068,43 @@ class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
             )
 
     def execute(self, context: Context):
-        self.log.info("Submitting job")
         self.hook = DataprocHook(gcp_conn_id=self.gcp_conn_id, impersonation_chain=self.impersonation_chain)
+        if not self.deferrable and not self.asynchronous:
+            self.execute_resumable(context)
+            return self.job_id
+
+        job_id = self.submit_job(context)
+        if self.deferrable:
+            job = self.hook.get_job(project_id=self.project_id, region=self.region, job_id=job_id)
+            state = job.status.state
+            if state == JobStatus.State.DONE:
+                return job_id
+            if state == JobStatus.State.ERROR:
+                raise AirflowException(f"Job failed:\n{job}")
+            if state == JobStatus.State.CANCELLED:
+                raise AirflowException(f"Job was cancelled:\n{job}")
+            self.defer(
+                trigger=DataprocSubmitTrigger(
+                    job_id=job_id,
+                    project_id=self.project_id,
+                    region=self.region,
+                    gcp_conn_id=self.gcp_conn_id,
+                    impersonation_chain=self.impersonation_chain,
+                    polling_interval_seconds=self.polling_interval_seconds,
+                    cancel_on_kill=self.cancel_on_kill,
+                ),
+                method_name="execute_complete",
+            )
+        return job_id
+
+    def submit_job(self, context: Any) -> str:
+        """Submit the job, persist its extra link and return the new job id."""
+        self.log.info("Submitting job")
         if self.openlineage_inject_parent_job_info or self.openlineage_inject_transport_info:
             self.log.info("Automatic injection of OpenLineage information into Spark properties is enabled.")
             self._inject_openlineage_properties_into_dataproc_job(context)
 
-        job_object = self.hook.submit_job(
+        job_object = self.hook.submit_job(  # type: ignore[union-attr]
             project_id=self.project_id,
             region=self.region,
             job=self.job,
@@ -2039,45 +2115,53 @@ class DataprocSubmitJobOperator(GoogleCloudBaseOperator):
         )
         new_job_id: str = job_object.reference.job_id
         self.log.info("Job %s submitted successfully.", new_job_id)
+        self._persist_job_link(context, new_job_id)
+        self.job_id = new_job_id
+        return new_job_id
+
+    def _persist_job_link(self, context: Any, job_id: str) -> None:
         # Save data required by extra links no matter what the job status will be
-        project_id = self.project_id or self.hook.project_id
+        project_id = self.project_id or self.hook.project_id  # type: ignore[union-attr]
         if project_id:
             DataprocJobLink.persist(
                 context=context,
-                job_id=new_job_id,
+                job_id=job_id,
                 region=self.region,
                 project_id=project_id,
             )
 
-        self.job_id = new_job_id
-        if self.deferrable:
-            job = self.hook.get_job(project_id=self.project_id, region=self.region, job_id=self.job_id)
-            state = job.status.state
-            if state == JobStatus.State.DONE:
-                return self.job_id
-            if state == JobStatus.State.ERROR:
-                raise AirflowException(f"Job failed:\n{job}")
-            if state == JobStatus.State.CANCELLED:
-                raise AirflowException(f"Job was cancelled:\n{job}")
-            self.defer(
-                trigger=DataprocSubmitTrigger(
-                    job_id=self.job_id,
-                    project_id=self.project_id,
-                    region=self.region,
-                    gcp_conn_id=self.gcp_conn_id,
-                    impersonation_chain=self.impersonation_chain,
-                    polling_interval_seconds=self.polling_interval_seconds,
-                    cancel_on_kill=self.cancel_on_kill,
-                ),
-                method_name="execute_complete",
+    def get_job_status(self, external_id: JsonValue, context: Any) -> str:
+        """Return the Dataproc job state name, or ``not_found`` if the job no longer exists."""
+        job_id = str(external_id)
+        try:
+            job = self.hook.get_job(  # type: ignore[union-attr]
+                project_id=self.project_id, region=self.region, job_id=job_id
             )
-        elif not self.asynchronous:
-            self.log.info("Waiting for job %s to complete", new_job_id)
-            self.hook.wait_for_job(
-                job_id=new_job_id, region=self.region, project_id=self.project_id, timeout=self.wait_timeout
-            )
-            self.log.info("Job %s completed successfully.", new_job_id)
-        return self.job_id
+        except NotFound:
+            return "not_found"
+        # On reconnect submit_job never runs, so the job id and its link are set here instead.
+        self.job_id = job_id
+        self._persist_job_link(context, job_id)
+        return JobStatus.State(job.status.state).name
+
+    def is_job_active(self, status: str) -> bool:
+        # ATTEMPT_FAILURE is not terminal: Dataproc restarts restartable jobs after it.
+        # CANCEL_PENDING and CANCEL_STARTED end in CANCELLED, so those jobs are resubmitted.
+        return status in ("PENDING", "SETUP_DONE", "RUNNING", "ATTEMPT_FAILURE")
+
+    def is_job_succeeded(self, status: str) -> bool:
+        return status == "DONE"
+
+    def poll_until_complete(self, external_id: JsonValue, context: Any) -> None:
+        job_id = str(external_id)
+        self.log.info("Waiting for job %s to complete", job_id)
+        self.hook.wait_for_job(  # type: ignore[union-attr]
+            job_id=job_id, region=self.region, project_id=self.project_id, timeout=self.wait_timeout
+        )
+        self.log.info("Job %s completed successfully.", job_id)
+
+    def get_job_result(self, external_id: JsonValue, context: Any) -> None:
+        return None
 
     def execute_complete(self, context, event=None) -> None:
         """
