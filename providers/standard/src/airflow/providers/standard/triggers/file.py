@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import fnmatch
+import hashlib
+import json
 import logging
 import os
 from collections.abc import AsyncIterator, Hashable
@@ -38,6 +41,8 @@ else:
     )
 
 log = logging.getLogger(__name__)
+
+_WATERMARK_KEY_PREFIX = "directory_file_watermark"
 
 
 class FileTrigger(BaseTrigger):
@@ -244,3 +249,146 @@ class DirectoryFileDeleteTrigger(BaseEventTrigger):
         kwargs = self.serialize()[1]
         async for event in self.filter_shared_stream(type(self).open_shared_stream(kwargs)):
             yield event
+
+
+class DirectoryFileWatermarkTrigger(BaseEventTrigger):
+    """
+    Fire when files in ``directory`` are newer than the stored watermark.
+
+    Unlike ``DirectoryFileDeleteTrigger``, matched files are left in place. The trigger keeps a watermark
+    (the newest modification time seen, plus the names of the files that share it) in the asset state
+    store, and fires once per scan with every matching file whose modification time is past the
+    watermark. Files that are modified after they fired make the trigger fire again. Files written with
+    an older modification time than the watermark (for example ``cp -p`` or ``rsync -t``) are not seen.
+
+    The first scan, when there is no watermark yet, fires for every matching file already in the
+    directory. Delivery is at-least-once: the watermark is saved after the event is handed to the
+    triggerer, so a triggerer failure in between fires the same files again.
+
+    Requires Airflow 3.3+ and an ``AssetWatcher`` on exactly one asset, since the watermark lives in that
+    asset's state store.
+
+    :param directory: Directory to scan. Subdirectories are not scanned.
+    :param pattern: ``fnmatch`` pattern that file names must match.
+    :param poke_interval: Time to wait between scans.
+    """
+
+    def __init__(
+        self,
+        *,
+        directory: str,
+        pattern: str = "*",
+        poke_interval: float = 5.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.directory = directory
+        self.pattern = pattern
+        self.poke_interval = poke_interval
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        """Serialize DirectoryFileWatermarkTrigger arguments and classpath."""
+        return (
+            "airflow.providers.standard.triggers.file.DirectoryFileWatermarkTrigger",
+            {
+                "directory": self.directory,
+                "pattern": self.pattern,
+                "poke_interval": self.poke_interval,
+            },
+        )
+
+    @property
+    def _watermark_key(self) -> str:
+        # Several watchers on one asset may point at different directories, so each gets its own key.
+        identity = json.dumps(
+            {"directory": os.path.realpath(self.directory), "pattern": self.pattern},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return f"{_WATERMARK_KEY_PREFIX}:{hashlib.sha256(identity).hexdigest()}"
+
+    def _get_store(self) -> Any:
+        store = getattr(self, "asset_state_store", None)
+        if store is None:
+            raise RuntimeError(
+                "DirectoryFileWatermarkTrigger needs the asset state store, which requires Airflow 3.3+ "
+                "and an AssetWatcher on exactly one asset"
+            )
+        return store
+
+    async def _load_watermark(self, store: Any) -> tuple[int, set[str]] | None:
+        try:
+            # aget/aset landed in Airflow 3.3.2; 3.3.0 and 3.3.1 only expose the blocking API.
+            if hasattr(store, "aget"):
+                value = await store.aget(self._watermark_key)
+            else:
+                value = await asyncio.to_thread(store.get, self._watermark_key)
+        except ValueError as e:
+            raise RuntimeError(
+                "DirectoryFileWatermarkTrigger must be used in an AssetWatcher on exactly one asset"
+            ) from e
+        if value is None:
+            return None
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("mtime_ns"), int)
+            or not isinstance(value.get("names"), list)
+        ):
+            self.log.warning("Stored watermark for %s is invalid; scanning from the start", self.directory)
+            return None
+        return value["mtime_ns"], set(value["names"])
+
+    async def _save_watermark(self, store: Any, mtime_ns: int, names: set[str]) -> None:
+        value = {"mtime_ns": mtime_ns, "names": sorted(names)}
+        if hasattr(store, "aset"):
+            await store.aset(self._watermark_key, value)
+        else:
+            await asyncio.to_thread(store.set, self._watermark_key, value)
+
+    async def _scan(self) -> dict[str, int]:
+        """Return the modification time in nanoseconds of every matching file in the directory."""
+        files: dict[str, int] = {}
+        try:
+            async for path in anyio.Path(self.directory).iterdir():
+                if not fnmatch.fnmatch(path.name, self.pattern):
+                    continue
+                try:
+                    if not await path.is_file():
+                        continue
+                    files[path.name] = (await path.stat()).st_mtime_ns
+                except FileNotFoundError:
+                    continue
+        except FileNotFoundError:
+            pass
+        return files
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        """Scan the directory forever and fire for files past the watermark."""
+        store = self._get_store()
+        watermark = await self._load_watermark(store)
+        while True:
+            files = await self._scan()
+            if watermark is None:
+                new_names = set(files)
+            else:
+                wm_mtime_ns, wm_names = watermark
+                new_names = {
+                    name
+                    for name, mtime_ns in files.items()
+                    if mtime_ns > wm_mtime_ns or (mtime_ns == wm_mtime_ns and name not in wm_names)
+                }
+            if new_names:
+                newest = max(files[name] for name in new_names)
+                names_at_newest = {name for name in new_names if files[name] == newest}
+                if watermark is not None and newest == watermark[0]:
+                    names_at_newest |= watermark[1]
+                self.log.info("Found %d new file(s) in %s", len(new_names), self.directory)
+                yield TriggerEvent(
+                    {
+                        "directory": self.directory,
+                        "filepaths": [os.path.join(self.directory, name) for name in sorted(new_names)],
+                    }
+                )
+                watermark = (newest, names_at_newest)
+                await self._save_watermark(store, *watermark)
+            await asyncio.sleep(self.poke_interval)

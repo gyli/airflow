@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import anyio
 import pytest
 
 from airflow.providers.standard.triggers.file import (
     DirectoryFileDeleteTrigger,
+    DirectoryFileWatermarkTrigger,
     FileDeleteTrigger,
     FileTrigger,
 )
@@ -315,3 +317,159 @@ class TestDirectoryFileDeleteTrigger:
 
         assert event.payload == {"filepath": str(target)}
         assert await target.exists() is False
+
+
+class _SyncStore:
+    """Asset state store as exposed on Airflow 3.3.0 and 3.3.1, without aget/aset."""
+
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+class _AsyncStore(_SyncStore):
+    async def aget(self, key, default=None):
+        return self.get(key, default)
+
+    async def aset(self, key, value):
+        self.set(key, value)
+
+
+class _MultiAssetStore:
+    async def aget(self, key, default=None):
+        raise ValueError("Task has 2 concrete inlets and outlets")
+
+
+class TestDirectoryFileWatermarkTrigger:
+    MTIME_NS = 1_700_000_000_000_000_000
+
+    @staticmethod
+    def _write(directory, name, mtime_ns):
+        path = directory / name
+        path.write_text("x")
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+
+    def _make_trigger(self, directory, store, **kwargs):
+        trigger = DirectoryFileWatermarkTrigger(directory=str(directory), poke_interval=0.01, **kwargs)
+        trigger.asset_state_store = store
+        return trigger
+
+    def test_serialization(self):
+        trigger = DirectoryFileWatermarkTrigger(directory="/tmp/inbox", pattern="*.csv", poke_interval=3.0)
+        classpath, kwargs = trigger.serialize()
+        assert classpath == "airflow.providers.standard.triggers.file.DirectoryFileWatermarkTrigger"
+        assert kwargs == {"directory": "/tmp/inbox", "pattern": "*.csv", "poke_interval": 3.0}
+
+    @pytest.mark.asyncio
+    async def test_first_scan_fires_for_existing_matching_files_and_keeps_them(self, tmp_path):
+        self._write(tmp_path, "a.csv", self.MTIME_NS)
+        self._write(tmp_path, "b.csv", self.MTIME_NS + 1)
+        self._write(tmp_path, "c.txt", self.MTIME_NS + 2)
+        (tmp_path / "sub.csv").mkdir()
+        store = _AsyncStore()
+        trigger = self._make_trigger(tmp_path, store, pattern="*.csv")
+        gen = trigger.run()
+
+        event = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+
+        assert event.payload == {
+            "directory": str(tmp_path),
+            "filepaths": [str(tmp_path / "a.csv"), str(tmp_path / "b.csv")],
+        }
+        assert (tmp_path / "a.csv").exists()
+        assert (tmp_path / "b.csv").exists()
+
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.sleep(0.1)
+        assert task.done() is False
+        task.cancel()
+        assert store.data == {trigger._watermark_key: {"mtime_ns": self.MTIME_NS + 1, "names": ["b.csv"]}}
+
+    @pytest.mark.asyncio
+    async def test_resumes_from_stored_watermark(self, tmp_path):
+        self._write(tmp_path, "old", self.MTIME_NS - 1)
+        self._write(tmp_path, "seen", self.MTIME_NS)
+        self._write(tmp_path, "same_mtime", self.MTIME_NS)
+        self._write(tmp_path, "newer", self.MTIME_NS + 1)
+        trigger = self._make_trigger(tmp_path, None)
+        store = _AsyncStore({trigger._watermark_key: {"mtime_ns": self.MTIME_NS, "names": ["seen"]}})
+        trigger.asset_state_store = store
+
+        event = await asyncio.wait_for(trigger.run().__anext__(), timeout=1.0)
+
+        assert event.payload["filepaths"] == [str(tmp_path / "newer"), str(tmp_path / "same_mtime")]
+
+    @pytest.mark.asyncio
+    async def test_fires_again_for_file_with_same_mtime_as_watermark(self, tmp_path):
+        self._write(tmp_path, "a", self.MTIME_NS)
+        store = _AsyncStore()
+        trigger = self._make_trigger(tmp_path, store)
+        gen = trigger.run()
+        first = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert first.payload["filepaths"] == [str(tmp_path / "a")]
+
+        self._write(tmp_path, "b", self.MTIME_NS)
+        second = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+
+        assert second.payload["filepaths"] == [str(tmp_path / "b")]
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.sleep(0.1)
+        assert task.done() is False
+        task.cancel()
+        assert store.data[trigger._watermark_key] == {"mtime_ns": self.MTIME_NS, "names": ["a", "b"]}
+
+    @pytest.mark.asyncio
+    async def test_uses_blocking_store_api_when_async_api_is_missing(self, tmp_path):
+        self._write(tmp_path, "seen", self.MTIME_NS)
+        self._write(tmp_path, "new", self.MTIME_NS + 1)
+        trigger = self._make_trigger(tmp_path, None)
+        store = _SyncStore({trigger._watermark_key: {"mtime_ns": self.MTIME_NS, "names": ["seen"]}})
+        trigger.asset_state_store = store
+        gen = trigger.run()
+
+        event = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.sleep(0.1)
+        task.cancel()
+
+        assert event.payload["filepaths"] == [str(tmp_path / "new")]
+        assert store.data[trigger._watermark_key] == {"mtime_ns": self.MTIME_NS + 1, "names": ["new"]}
+
+    @pytest.mark.asyncio
+    async def test_invalid_stored_watermark_scans_from_the_start(self, tmp_path):
+        self._write(tmp_path, "a", self.MTIME_NS)
+        trigger = self._make_trigger(tmp_path, None)
+        trigger.asset_state_store = _AsyncStore({trigger._watermark_key: "not-a-watermark"})
+
+        event = await asyncio.wait_for(trigger.run().__anext__(), timeout=1.0)
+
+        assert event.payload["filepaths"] == [str(tmp_path / "a")]
+
+    @pytest.mark.asyncio
+    async def test_missing_directory_does_not_fire(self, tmp_path):
+        trigger = self._make_trigger(tmp_path / "missing", _AsyncStore())
+        task = asyncio.create_task(trigger.run().__anext__())
+
+        await asyncio.sleep(0.1)
+
+        assert task.done() is False
+        task.cancel()
+
+    @pytest.mark.parametrize(
+        ("store", "match"),
+        [
+            pytest.param(None, "requires Airflow 3.3", id="no-store"),
+            pytest.param(_MultiAssetStore(), "exactly one asset", id="several-assets"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_raises_without_a_single_asset_store(self, tmp_path, store, match):
+        trigger = self._make_trigger(tmp_path, store)
+
+        with pytest.raises(RuntimeError, match=match):
+            await trigger.run().__anext__()
