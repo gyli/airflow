@@ -742,6 +742,23 @@ spark_job_template.json
 An alternative method, apart from using YAML or JSON files, is to directly pass the ``template_spec`` field instead of application_file
 if you prefer not to employ a file for configuration.
 
+Durable execution
+^^^^^^^^^^^^^^^^^
+
+Like ``KubernetesPodOperator``, ``SparkKubernetesOperator`` takes a ``durable`` parameter (default
+``True``). If the worker dies while the Spark driver pod is running and the task is retried, the
+operator reattaches to that driver pod instead of creating a second SparkApplication.
+
+On Airflow 3.3+, the operator persists the SparkApplication name and namespace to
+:doc:`task state store <apache-airflow:core-concepts/task-state-store>` before it creates the
+application. On retry, it reads the ``<name>-driver`` pod directly. It falls back to the label search
+on ``dag_id``, ``task_id`` and ``run_id`` when nothing usable is stored, when the driver pod no
+longer exists, or when the stored driver pod has failed or was already handled by an earlier try.
+Below 3.3, ``durable`` has no effect and only the label search is used.
+
+``reattach_on_restart`` is deprecated in favor of ``durable``, with the same rules as for
+``KubernetesPodOperator``. See :ref:`howto/operator:kubernetespodoperator` for the details.
+
 
 Reference
 ^^^^^^^^^
