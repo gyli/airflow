@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from kubernetes.client import CoreV1Api, CustomObjectsApi, models as k8s
+from kubernetes.client.rest import ApiException
 
 from airflow.providers.cncf.kubernetes import pod_generator
 from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook, _load_body_to_dict
@@ -38,6 +39,10 @@ if TYPE_CHECKING:
     import jinja2
 
     from airflow.sdk import Context
+
+# Key used to persist/retrieve a submitted SparkApplication's identity in task_state_store across retries.
+# Renaming this on a deployed operator breaks in flight retries because the old key is already stored.
+SPARK_APPLICATION_STATE_KEY = "spark_application"
 
 
 class SparkKubernetesOperator(KubernetesPodOperator):
@@ -63,9 +68,15 @@ class SparkKubernetesOperator(KubernetesPodOperator):
     :param success_run_history_limit: Number of past successful runs of the application to keep.
     :param startup_timeout_seconds: timeout in seconds to startup the pod.
     :param log_events_on_failure: Log the pod's events if a failure occurs
-    :param reattach_on_restart: if the scheduler dies while the pod is running, reattach and monitor.
-        When enabled, the operator automatically adds Airflow task context labels (dag_id, task_id, run_id)
-        to the driver and executor pods to enable finding them for reattachment.
+    :param reattach_on_restart: deprecated, use ``durable`` instead. If the worker dies while the
+        driver pod is running, reattach and monitor during the next try. Below Airflow 3.3, this remains
+        the only way to control that behavior, since ``durable`` has no effect there.
+    :param durable: if the worker dies while the driver pod is running, reattach and monitor during the
+        next try instead of creating a duplicate SparkApplication. On Airflow 3.3+, the SparkApplication
+        name and namespace are persisted in task state store and used to find the driver pod on retry,
+        falling back to a label search when nothing usable is stored. When enabled, the operator also adds
+        Airflow task context labels (dag_id, task_id, run_id) to the driver and executor pods for that
+        label search. Defaults to ``True``.
     :param delete_on_termination: What to do when the pod reaches its final
         state, or the execution is interrupted. If True (default), delete the
         pod; if False, leave the pod.
@@ -94,20 +105,20 @@ class SparkKubernetesOperator(KubernetesPodOperator):
         success_run_history_limit: int = 1,
         startup_timeout_seconds=600,
         log_events_on_failure: bool = False,
-        reattach_on_restart: bool = True,
+        reattach_on_restart: bool | None = None,
+        durable: bool | None = None,
         delete_on_termination: bool = True,
         kubernetes_conn_id: str = "kubernetes_default",
         random_name_suffix: bool = True,
         **kwargs,
     ) -> None:
-        super().__init__(name=name, **kwargs)
+        super().__init__(name=name, reattach_on_restart=reattach_on_restart, durable=durable, **kwargs)
         self.image = image
         self.code_path = code_path
         self.application_file = application_file
         self.template_spec = template_spec
         self.kubernetes_conn_id = kubernetes_conn_id
         self.startup_timeout_seconds = startup_timeout_seconds
-        self.reattach_on_restart = reattach_on_restart
         self.delete_on_termination = delete_on_termination
         self.do_xcom_push = do_xcom_push
         self.namespace = namespace
@@ -294,6 +305,63 @@ class SparkKubernetesOperator(KubernetesPodOperator):
             self.log.info("`try_number` of pod: %s", pod.metadata.labels.get("try_number", "unknown"))
         return pod
 
+    def _get_driver_pod_from_task_state_store(self, context: Context) -> k8s.V1Pod | None:
+        task_state_store = context.get("task_state_store")
+        if task_state_store is None:
+            return None
+        stored = task_state_store.get(SPARK_APPLICATION_STATE_KEY)
+        if not isinstance(stored, dict):
+            return None
+        name, namespace = stored.get("name"), stored.get("namespace")
+        if not isinstance(name, str) or not isinstance(namespace, str):
+            self.log.warning(
+                "SparkApplication identity stored in task state store is malformed (%s), "
+                "falling back to label search.",
+                stored,
+            )
+            return None
+        driver_pod_name = f"{name}-driver"
+        try:
+            pod = self.client.read_namespaced_pod(driver_pod_name, namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            self.log.warning(
+                "Driver pod %s/%s from task state store no longer exists, falling back to label search.",
+                namespace,
+                driver_pod_name,
+            )
+            return None
+        if (pod.metadata.labels or {}).get(self.POD_CHECKED_KEY) == "True":
+            self.log.info(
+                "Driver pod %s/%s from task state store was already checked by a prior attempt, "
+                "not reattaching to it.",
+                namespace,
+                driver_pod_name,
+            )
+            return None
+        # Same phases the label search excludes in _get_field_selector.
+        if pod.status and pod.status.phase in (PodPhase.FAILED, PodPhase.UNKNOWN):
+            self.log.info(
+                "Driver pod %s/%s from task state store is in phase %s, not reattaching to it.",
+                namespace,
+                driver_pod_name,
+                pod.status.phase,
+            )
+            return None
+        self.log.info(
+            "Reconnecting to driver pod %s/%s via identity persisted in task state store.",
+            namespace,
+            driver_pod_name,
+        )
+        return pod
+
+    def _persist_spark_application_identity(self, context: Context, name: str) -> None:
+        task_state_store = context.get("task_state_store")
+        if task_state_store is None:
+            return
+        task_state_store.set(SPARK_APPLICATION_STATE_KEY, {"name": name, "namespace": self.namespace})
+
     def _get_field_selector(self) -> str:
         # Exclude terminal failure states to get only running, pending and succeeded pods.
         return f"status.phase!={PodPhase.FAILED},status.phase!={PodPhase.UNKNOWN}"
@@ -342,6 +410,9 @@ class SparkKubernetesOperator(KubernetesPodOperator):
             driver_pod = self.find_spark_job(context)
             if driver_pod:
                 return driver_pod
+            # Persisted before creation so a worker dying while the operator waits for the driver to
+            # start still leaves an identity for the next try.
+            self._persist_spark_application_identity(context, launcher.body["metadata"]["name"])
 
         driver_pod, spark_obj_spec = launcher.start_spark_job(
             image=self.image, code_path=self.code_path, startup_timeout=self.startup_timeout_seconds
@@ -368,7 +439,13 @@ class SparkKubernetesOperator(KubernetesPodOperator):
         if self.reattach_on_restart:
             task_context_labels = self._get_ti_pod_labels(context)
 
-            existing_pod = self.find_spark_job(context)
+            existing_pod = self._get_driver_pod_from_task_state_store(context)
+            if existing_pod is None:
+                existing_pod = self.find_spark_job(context)
+                if existing_pod:
+                    self._persist_spark_application_identity(
+                        context, existing_pod.metadata.name.removesuffix("-driver")
+                    )
             if existing_pod:
                 self.log.info(
                     "Found existing Spark driver pod %s. Reattaching to it.", existing_pod.metadata.name

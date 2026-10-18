@@ -31,10 +31,16 @@ import pytest
 import pytest_asyncio
 import yaml
 from kubernetes.client import models as k8s
+from kubernetes.client.exceptions import ApiException
 
 from airflow import DAG
+from airflow.exceptions import AirflowProviderDeprecationWarning
 from airflow.models import Connection, DagRun, TaskInstance
-from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKubernetesOperator
+from airflow.providers.cncf.kubernetes.operators.custom_object_launcher import CustomObjectLauncher
+from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import (
+    SPARK_APPLICATION_STATE_KEY,
+    SparkKubernetesOperator,
+)
 from airflow.providers.cncf.kubernetes.pod_generator import MAX_LABEL_LEN
 from airflow.providers.cncf.kubernetes.triggers.pod import KubernetesPodTrigger
 from airflow.providers.cncf.kubernetes.utils.pod_manager import PodPhase
@@ -42,7 +48,7 @@ from airflow.providers.common.compat.sdk import TaskDeferred, timezone
 from airflow.utils.types import DagRunType
 
 from tests_common.test_utils.taskinstance import create_task_instance
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_3_PLUS
 
 POD_MANAGER_CLASS = "airflow.providers.cncf.kubernetes.utils.pod_manager.PodManager"
 
@@ -339,8 +345,8 @@ class TestSparkKubernetesOperatorCreateApplication:
             application_file=application_file,
             template_spec=job_spec,
             kubernetes_conn_id="kubernetes_default_kube_config",
-            reattach_on_restart=False,  # Disable reattach for application creation tests
         )
+        op.reattach_on_restart = False
         context = create_context(op)
         op.execute(context)
         return op
@@ -607,8 +613,8 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=False,  # Disable reattach for basic tests
         )
+        op.reattach_on_restart = False
         context = create_context(op)
         op.execute(context)
         return op
@@ -916,7 +922,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
         op.execute(context)
@@ -953,7 +958,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
 
@@ -1002,7 +1006,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
 
@@ -1057,7 +1060,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
 
@@ -1111,7 +1113,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
 
@@ -1166,7 +1167,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
 
         context = create_context(op)
@@ -1222,7 +1222,6 @@ class TestSparkKubernetesOperator:
             kubernetes_conn_id="kubernetes_default_kube_config",
             task_id=task_name,
             get_logs=True,
-            reattach_on_restart=True,
         )
         context = create_context(op)
 
@@ -1271,8 +1270,8 @@ class TestSparkKubernetesOperator:
             template_spec=job_spec,
             kubernetes_conn_id="kubernetes_default_kube_config",
             deferrable=True,
-            reattach_on_restart=False,
         )
+        op.reattach_on_restart = False
         context = create_context(op)
         mock_execute_async = mocker.patch.object(op, "execute_async")
 
@@ -1303,8 +1302,8 @@ class TestSparkKubernetesOperator:
             template_spec=job_spec,
             kubernetes_conn_id="kubernetes_default_kube_config",
             deferrable=False,
-            reattach_on_restart=False,
         )
+        op.reattach_on_restart = False
         context = create_context(op)
 
         op.execute(context)
@@ -1568,7 +1567,6 @@ class TestSparkKubernetesLifecycle:
             task_id="test_task",
             namespace="default",
             application_file="example.yaml",
-            reattach_on_restart=True,
         )
 
         # Mock finding an existing pod
@@ -1620,8 +1618,8 @@ class TestSparkKubernetesLifecycle:
                     "executor": {},
                 },
             },
-            reattach_on_restart=False,
         )
+        op.reattach_on_restart = False
         op.name = "my-spark-app-abc123"
 
         with mock.patch.object(op, "get_or_create_spark_crd", return_value=mock.MagicMock()):
@@ -1648,8 +1646,8 @@ class TestSparkKubernetesLifecycle:
                     "executor": {"env": [{"name": "SPARK_APPLICATION_NAME", "value": "user-defined"}]},
                 },
             },
-            reattach_on_restart=False,
         )
+        op.reattach_on_restart = False
         op.name = "my-spark-app-abc123"
 
         with mock.patch.object(op, "get_or_create_spark_crd", return_value=mock.MagicMock()):
@@ -1661,3 +1659,176 @@ class TestSparkKubernetesLifecycle:
             app_name_envs = [e for e in env if e["name"] == "SPARK_APPLICATION_NAME"]
             assert len(app_name_envs) == 1  # not duplicated
             assert app_name_envs[0]["value"] == "user-defined"
+
+
+@patch("airflow.providers.cncf.kubernetes.operators.spark_kubernetes.SparkKubernetesOperator.client")
+@patch.object(SparkKubernetesOperator, "_get_ti_pod_labels", return_value={})
+@patch.object(SparkKubernetesOperator, "find_spark_job", return_value=None)
+@patch.object(CustomObjectLauncher, "start_spark_job")
+class TestSparkKubernetesDurable:
+    APP_NAME = "my-spark-app"
+
+    @staticmethod
+    def make_operator():
+        op = SparkKubernetesOperator(
+            task_id="test_task",
+            namespace="default",
+            template_spec={
+                "apiVersion": "sparkoperator.k8s.io/v1beta2",
+                "kind": "SparkApplication",
+                "spec": {"driver": {}, "executor": {}},
+            },
+        )
+        op.name = "new-spark-app"
+        return op
+
+    @staticmethod
+    def make_context(stored=None):
+        task_state_store = mock.MagicMock()
+        task_state_store.get.return_value = stored
+        return {"ti": mock.MagicMock(), "run_id": "test_run", "task_state_store": task_state_store}
+
+    @staticmethod
+    def make_driver_pod(name, phase, labels=None):
+        return k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(name=name, namespace="default", labels=labels or {}),
+            status=k8s.V1PodStatus(phase=phase),
+        )
+
+    def test_fresh_submit_persists_identity_before_creating_application(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client
+    ):
+        op = self.make_operator()
+        context = self.make_context()
+        manager = mock.Mock()
+        manager.attach_mock(context["task_state_store"].set, "set")
+        manager.attach_mock(mock_start_spark_job, "start_spark_job")
+        mock_start_spark_job.return_value = (mock.MagicMock(), {})
+
+        op._setup_spark_configuration(context)
+
+        assert [c[0] for c in manager.mock_calls] == ["set", "start_spark_job"]
+        context["task_state_store"].set.assert_called_once_with(
+            SPARK_APPLICATION_STATE_KEY, {"name": "new-spark-app", "namespace": "default"}
+        )
+
+    @pytest.mark.parametrize("phase", [PodPhase.PENDING, PodPhase.RUNNING, PodPhase.SUCCEEDED])
+    def test_reconnects_via_stored_identity(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client, phase
+    ):
+        op = self.make_operator()
+        context = self.make_context({"name": self.APP_NAME, "namespace": "default"})
+        driver_pod = self.make_driver_pod(f"{self.APP_NAME}-driver", phase)
+        mock_client.read_namespaced_pod.return_value = driver_pod
+
+        op._setup_spark_configuration(context)
+
+        mock_client.read_namespaced_pod.assert_called_once_with(f"{self.APP_NAME}-driver", "default")
+        assert op.pod is driver_pod
+        assert op.name == self.APP_NAME
+        mock_find_spark_job.assert_not_called()
+        mock_start_spark_job.assert_not_called()
+        context["task_state_store"].set.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "driver_pod",
+        [
+            pytest.param(
+                k8s.V1Pod(
+                    metadata=k8s.V1ObjectMeta(name="my-spark-app-driver", labels={"already_checked": "True"}),
+                    status=k8s.V1PodStatus(phase=PodPhase.SUCCEEDED),
+                ),
+                id="already-checked",
+            ),
+            pytest.param(
+                k8s.V1Pod(
+                    metadata=k8s.V1ObjectMeta(name="my-spark-app-driver"),
+                    status=k8s.V1PodStatus(phase=PodPhase.FAILED),
+                ),
+                id="failed",
+            ),
+            pytest.param(
+                k8s.V1Pod(
+                    metadata=k8s.V1ObjectMeta(name="my-spark-app-driver"),
+                    status=k8s.V1PodStatus(phase=PodPhase.UNKNOWN),
+                ),
+                id="unknown",
+            ),
+        ],
+    )
+    def test_stored_driver_not_reusable_creates_new_application(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client, driver_pod
+    ):
+        op = self.make_operator()
+        context = self.make_context({"name": self.APP_NAME, "namespace": "default"})
+        mock_client.read_namespaced_pod.return_value = driver_pod
+        new_driver_pod = mock.MagicMock()
+        mock_start_spark_job.return_value = (new_driver_pod, {})
+
+        op._setup_spark_configuration(context)
+
+        mock_find_spark_job.assert_called()
+        mock_start_spark_job.assert_called_once()
+        assert op.pod is new_driver_pod
+        context["task_state_store"].set.assert_called_once_with(
+            SPARK_APPLICATION_STATE_KEY, {"name": "new-spark-app", "namespace": "default"}
+        )
+
+    def test_deleted_application_falls_back_to_label_search(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client
+    ):
+        op = self.make_operator()
+        context = self.make_context({"name": self.APP_NAME, "namespace": "default"})
+        mock_client.read_namespaced_pod.side_effect = ApiException(status=404)
+        found_pod = self.make_driver_pod("other-spark-app-driver", PodPhase.RUNNING)
+        mock_find_spark_job.return_value = found_pod
+
+        op._setup_spark_configuration(context)
+
+        assert op.pod is found_pod
+        assert op.name == "other-spark-app"
+        mock_start_spark_job.assert_not_called()
+        context["task_state_store"].set.assert_called_once_with(
+            SPARK_APPLICATION_STATE_KEY, {"name": "other-spark-app", "namespace": "default"}
+        )
+
+    def test_reraises_non_404_api_error(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client
+    ):
+        op = self.make_operator()
+        context = self.make_context({"name": self.APP_NAME, "namespace": "default"})
+        mock_client.read_namespaced_pod.side_effect = ApiException(status=500)
+
+        with pytest.raises(ApiException):
+            op._setup_spark_configuration(context)
+
+        mock_start_spark_job.assert_not_called()
+
+    @pytest.mark.parametrize("stored", ["not-a-dict", {"name": None, "namespace": "default"}, {"name": "x"}])
+    def test_malformed_identity_falls_back_to_label_search(
+        self, mock_start_spark_job, mock_find_spark_job, mock_labels, mock_client, stored
+    ):
+        op = self.make_operator()
+        context = self.make_context(stored)
+        mock_start_spark_job.return_value = (mock.MagicMock(), {})
+
+        op._setup_spark_configuration(context)
+
+        mock_client.read_namespaced_pod.assert_not_called()
+        mock_start_spark_job.assert_called_once()
+        context["task_state_store"].set.assert_called_once_with(
+            SPARK_APPLICATION_STATE_KEY, {"name": "new-spark-app", "namespace": "default"}
+        )
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_reattach_on_restart_is_deprecated(value):
+    with pytest.warns(AirflowProviderDeprecationWarning, match="`reattach_on_restart` is deprecated"):
+        op = SparkKubernetesOperator(task_id="test_task", reattach_on_restart=value)
+    assert op.reattach_on_restart is value
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_3_PLUS, reason="durable execution requires Airflow 3.3+")
+def test_durable_false_disables_reattach():
+    op = SparkKubernetesOperator(task_id="test_task", durable=False)
+    assert op.reattach_on_restart is False
